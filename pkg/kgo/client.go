@@ -89,6 +89,13 @@ type Client struct {
 	// replica, which only a rack aware replica selector does; see BalanceRacks.
 	sawPreferredReplica atomic.Bool
 
+	// noPaginatedMetadata is set once a broker rejects DescribeTopicPartitions
+	// after our version check said the key was usable (a mixed cluster
+	// mid-upgrade, or versions that lied). The all-topics metadata refresh
+	// permanently falls back to the Metadata API rather than paying a failed
+	// request every refresh.
+	noPaginatedMetadata atomic.Bool
+
 	metrics metrics
 
 	coordinatorsMu xsync.Mutex
@@ -1006,6 +1013,23 @@ func (cl *Client) supportsKIP848v1() bool {
 func (cl *Client) supportsClientMetrics() bool {
 	return cl.supportsKeyVersion(int16(kmsg.GetTelemetrySubscriptions), 0) &&
 		cl.supportsKeyVersion(int16(kmsg.PushTelemetry), 0)
+}
+
+// Called in the metadata update loop before an all-topics refresh.
+//
+// KIP-966's DescribeTopicPartitions paginates the full topic listing, which
+// avoids the one giant Metadata response that spikes memory and CPU on
+// clusters with many topics. We only opt in once a broker has advertised
+// the key, and a user MaxVersions cap without the key keeps us on the
+// legacy path, mirroring supportsKIP848v1.
+func (cl *Client) supportsPaginatedMetadata() bool {
+	if cl.noPaginatedMetadata.Load() {
+		return false
+	}
+	if mv := cl.cfg.maxVersions; mv != nil && !mv.HasKey(int16(kmsg.DescribeTopicPartitions)) {
+		return false
+	}
+	return cl.supportsKeyVersion(int16(kmsg.DescribeTopicPartitions), 0)
 }
 
 // A broker may not support some requests we want to make. This function checks

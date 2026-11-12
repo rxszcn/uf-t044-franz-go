@@ -5653,3 +5653,116 @@ func TestIssue1531(t *testing.T) {
 		})
 	}
 }
+
+// TestPaginatedMetadataRefresh verifies that a regex consumer's all-topics
+// metadata refresh uses KIP-966 paginated DescribeTopicPartitions requests
+// instead of one giant Metadata request, and that topics split across
+// pages are still discovered whole.
+func TestPaginatedMetadataRefresh(t *testing.T) {
+	t.Parallel()
+
+	var topics []string
+	for i := 0; i < 9; i++ {
+		topics = append(topics, "t-pg-"+strconv.Itoa(i))
+	}
+	c := newCluster(t, NumBrokers(1), SeedTopics(3, topics...))
+
+	// Force tiny pages so a handful of topics still paginates: 27
+	// partitions with a page limit of 4 means at least 7 pages per
+	// refresh, with topics split across page boundaries. Count both
+	// request kinds to prove which API the refresh uses.
+	var pages, fullMeta atomic.Int32
+	c.ControlKey(75, func(req kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		pages.Add(1)
+		req.(*kmsg.DescribeTopicPartitionsRequest).ResponsePartitionLimit = 4
+		return nil, nil, false
+	})
+	c.ControlKey(3, func(req kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		if req.(*kmsg.MetadataRequest).Topics == nil {
+			fullMeta.Add(1)
+		}
+		return nil, nil, false
+	})
+
+	producer := newPlainClient(t, c)
+	for _, topic := range topics {
+		produceNStrings(t, producer, topic, 3)
+	}
+
+	consumer := newPlainClient(t, c,
+		kgo.ConsumeRegex(),
+		kgo.ConsumeTopics("t-pg-.*"),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	consumeN(t, consumer, 27, 15*time.Second)
+
+	// The first refresh can race version discovery and legitimately take
+	// the legacy path, so reset the counters and force a refresh now that
+	// the client knows the cluster's versions.
+	pages.Store(0)
+	fullMeta.Store(0)
+	consumer.ForceMetadataRefresh()
+	deadline := time.Now().Add(10 * time.Second)
+	for pages.Load() < 7 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := pages.Load(); got < 7 {
+		t.Fatalf("got %d DescribeTopicPartitions pages, want at least 7 (27 partitions, page limit 4)", got)
+	}
+	if got := fullMeta.Load(); got != 0 {
+		t.Fatalf("client issued %d all-topics Metadata requests after learning versions, want 0", got)
+	}
+}
+
+// TestPaginatedMetadataFallback verifies that against a cluster too old
+// for KIP-966, a regex consumer's all-topics refresh uses the legacy
+// Metadata request and never issues DescribeTopicPartitions.
+func TestPaginatedMetadataFallback(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t, NumBrokers(1),
+		SeedTopics(2, "t-fb-a", "t-fb-b"),
+		MaxVersions(kversion.V3_7_0()), // DescribeTopicPartitions is 3.8+
+	)
+
+	var pages, fullMeta atomic.Int32
+	c.ControlKey(75, func(kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		pages.Add(1)
+		return nil, nil, false
+	})
+	c.ControlKey(3, func(req kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		if req.(*kmsg.MetadataRequest).Topics == nil {
+			fullMeta.Add(1)
+		}
+		return nil, nil, false
+	})
+
+	producer := newPlainClient(t, c)
+	produceNStrings(t, producer, "t-fb-a", 3)
+	produceNStrings(t, producer, "t-fb-b", 3)
+
+	consumer := newPlainClient(t, c,
+		kgo.ConsumeRegex(),
+		kgo.ConsumeTopics("t-fb-.*"),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	consumeN(t, consumer, 6, 15*time.Second)
+
+	consumer.ForceMetadataRefresh()
+	deadline := time.Now().Add(10 * time.Second)
+	for fullMeta.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if fullMeta.Load() == 0 {
+		t.Fatal("consumer never issued an all-topics Metadata request")
+	}
+	if got := pages.Load(); got != 0 {
+		t.Fatalf("client issued %d DescribeTopicPartitions requests to a cluster that does not support them, want 0", got)
+	}
+}

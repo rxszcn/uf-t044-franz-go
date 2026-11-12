@@ -12,6 +12,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo/internal/xsync"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 // PartitionMetadata contains information about a partition and its replicas.
@@ -677,9 +678,31 @@ func (mp metadataPartition) newPartition(cl *Client, kind partitionKind) *topicP
 // fetchTopicMetadata fetches metadata for all reqTopics and returns new
 // topicPartitionsData for each topic.
 func (cl *Client) fetchTopicMetadata(all bool, reqTopics []string, prune bool) (map[string]*metadataTopic, error) {
-	_, meta, err := cl.fetchMetadataByName(cl.ctx, all, reqTopics, prune, nil)
-	if err != nil {
-		return nil, err
+	var meta *kmsg.MetadataResponse
+	if all && cl.supportsPaginatedMetadata() {
+		pmeta, err := cl.fetchAllMetadataPaginated(cl.ctx, prune)
+		switch {
+		case err == nil:
+			meta = pmeta
+		case errors.Is(err, errBrokerTooOld) || errors.Is(err, errUnknownRequestKey) || errors.Is(err, kerr.UnsupportedVersion):
+			// Our version check said DescribeTopicPartitions was
+			// usable, but the broker we landed on rejected it: the
+			// cluster is mid-upgrade or its advertised versions do
+			// not match reality. Fall back to the Metadata API for
+			// good rather than paying a failed request before every
+			// refresh.
+			cl.noPaginatedMetadata.Store(true)
+			cl.cfg.logger.Log(LogLevelInfo, "paginated metadata refresh was rejected, permanently falling back to the metadata request", "err", err)
+		default:
+			return nil, err
+		}
+	}
+	if meta == nil {
+		var err error
+		_, meta, err = cl.fetchMetadataByName(cl.ctx, all, reqTopics, prune, nil)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	topics := make(map[string]*metadataTopic, len(meta.Topics))
@@ -795,6 +818,110 @@ func (cl *Client) fetchTopicMetadata(all bool, reqTopics []string, prune bool) (
 	}
 
 	return topics, nil
+}
+
+// fetchAllMetadataPaginated fetches all topics with KIP-966's
+// DescribeTopicPartitions, following the response cursor until every page
+// is read, and converts the merged pages into the equivalent all-topics
+// Metadata response so the rest of the refresh path is unchanged.
+//
+// DescribeTopicPartitions responses carry no broker list, so we first issue
+// a brokers-only Metadata request: that keeps broker, controller, and
+// cluster state fresh exactly as the legacy all-topics request did, and it
+// gives us the broker set that fetchTopicMetadata uses to validate
+// partition leaders.
+func (cl *Client) fetchAllMetadataPaginated(ctx context.Context, prune bool) (*kmsg.MetadataResponse, error) {
+	brokersReq := kmsg.NewPtrMetadataRequest()
+	brokersReq.Topics = []kmsg.MetadataRequestTopic{}
+	_, brokersMeta, err := cl.fetchMetadata(ctx, brokersReq, true, false, nil) // prune: no; brokers only, no opinion on topics
+	if err != nil {
+		return nil, err
+	}
+
+	req := kmsg.NewPtrDescribeTopicPartitionsRequest()
+	r := cl.retryable()
+	// Mirror fetchMetadata: internal refreshes get a small retry bound
+	// because they block other work.
+	r.limitRetries = 3
+
+	merged := &kmsg.MetadataResponse{
+		Version:      brokersMeta.Version,
+		Brokers:      brokersMeta.Brokers,
+		ClusterID:    brokersMeta.ClusterID,
+		ControllerID: brokersMeta.ControllerID,
+	}
+	topicIdx := make(map[string]int)
+
+	// The cursor we last sent, used to verify the broker advances. A
+	// broker that keeps answering the same cursor would otherwise loop
+	// us forever.
+	sentTopic := ""
+	sentPartition := int32(-1)
+	for {
+		resp, err := req.RequestWith(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		mergeDescribeTopicPartitionsPage(merged, topicIdx, resp)
+
+		nc := resp.NextCursor
+		if nc == nil {
+			break
+		}
+		if nc.Topic < sentTopic || nc.Topic == sentTopic && nc.Partition <= sentPartition {
+			return nil, fmt.Errorf("describe topic partitions cursor did not advance past topic %q partition %d", nc.Topic, nc.Partition)
+		}
+		sentTopic, sentPartition = nc.Topic, nc.Partition
+		req.Cursor = &kmsg.DescribeTopicPartitionsRequestCursor{
+			Topic:     nc.Topic,
+			Partition: nc.Partition,
+		}
+	}
+
+	// Keep the metadata cache semantics of the legacy all-topics request:
+	// a nil-topics request marks this as a full listing, so the cache
+	// records allAt and prunes stale topics the same way.
+	cacheReq := kmsg.NewPtrMetadataRequest()
+	cl.storeCachedMeta(cacheReq, merged, prune, nil)
+
+	return merged, nil
+}
+
+// mergeDescribeTopicPartitionsPage converts one DescribeTopicPartitions
+// page into Metadata response topics and appends them to merged, stitching
+// together topics whose partitions span the partition limit and are split
+// across consecutive pages. topicIdx maps a topic name to its index in
+// merged.Topics and is carried across pages.
+func mergeDescribeTopicPartitionsPage(merged *kmsg.MetadataResponse, topicIdx map[string]int, resp *kmsg.DescribeTopicPartitionsResponse) {
+	for i := range resp.Topics {
+		st := &resp.Topics[i]
+		if st.Topic == nil {
+			continue
+		}
+		mt := kmsg.NewMetadataResponseTopic()
+		mt.ErrorCode = st.ErrorCode
+		mt.Topic = st.Topic
+		mt.TopicID = st.TopicID
+		mt.IsInternal = st.IsInternal
+		for j := range st.Partitions {
+			sp := &st.Partitions[j]
+			mp := kmsg.NewMetadataResponseTopicPartition()
+			mp.ErrorCode = sp.ErrorCode
+			mp.Partition = sp.Partition
+			mp.Leader = sp.LeaderID
+			mp.LeaderEpoch = sp.LeaderEpoch
+			mp.Replicas = sp.Replicas
+			mp.ISR = sp.ISR
+			mp.OfflineReplicas = sp.OfflineReplicas
+			mt.Partitions = append(mt.Partitions, mp)
+		}
+		if at, ok := topicIdx[*st.Topic]; ok {
+			merged.Topics[at].Partitions = append(merged.Topics[at].Partitions, mt.Partitions...)
+			continue
+		}
+		topicIdx[*st.Topic] = len(merged.Topics)
+		merged.Topics = append(merged.Topics, mt)
+	}
 }
 
 // mergeTopicPartitions merges a new topicPartition into an old and returns
